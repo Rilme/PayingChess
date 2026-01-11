@@ -1,0 +1,416 @@
+import os
+from decimal import Decimal
+
+class Config:
+   SECRET_KEY = os.getenv("JWT_SECRET")
+   STRIPE_SECRET = os.getenv("STRIPE_SECRET_KEY")
+   STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
+   DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://localhost/chess")
+
+   ALGORITHM = "HS256"
+   TOKEN_EXPIRE_HOURS = 1
+
+   MIN_WAGER = Decimal("5.00")
+   MAX_WAGER_DEFAULT = Decimal("100.00")
+   MAX_DEPOSIT = Decimal("10000.00")
+   HOUSE_RAKE = Decimal("0.05")  # 5-6.5% depending on state or user
+
+   AGE_MINIMUM = 19
+   MAX_WITHDRAWALS = 3
+   SUSPENSION_DAYS = 60
+
+   GAME_MOVE_TIMEOUT = 300
+   MAX_LOGIN_ATTEMPTS = 5
+   OTP_MAX_ATTEMPTS = 3
+
+   CONSENT_VERSION = "1.0"
+
+   # CORS
+   CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
+
+   # Stripe fees
+   DEPOSIT_FEE_PERCENT = Decimal("0.029")  # 2.9%
+   DEPOSIT_FEE_FLAT = Decimal("0.30")
+   WITHDRAWAL_FEE = Decimal("2.00")  # optional
+
+   # Invite-only
+   INVITE_ONLY = True
+
+   # Geo-policy
+   US_MUST_BLOCK = {"WA", "ID"}
+   US_RESTRICTED = {"CA", "KY", "VA", "MA"}
+
+   COUNTRY_MUST_BLOCK = {"SA", "KW", "QA", "OM", "BH", "IR", "IQ", "YE", "LY", "DZ"}
+   COUNTRY_RESTRICTED = {"AE", "EG", "MA", "LB"}
+
+   STATE_WAGER_LIMITS = {
+       "TX": Decimal("50.00"),
+       "NY": Decimal("25.00"),
+   }
+
+   @classmethod
+   def validate(cls):
+       missing = []
+       for var in ["SECRET_KEY", "STRIPE_SECRET", "STRIPE_WEBHOOK_SECRET"]:
+           if not getattr(cls, var):
+               missing.append(var)
+       if missing:
+           raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
+
+Config.validate()
+
+from datetime import datetime
+from decimal import Decimal
+from sqlalchemy import (
+   Column, Integer, String, Boolean, DateTime, Numeric, ForeignKey, Index, CheckConstraint
+)
+from sqlalchemy.orm import declarative_base
+
+Base = declarative_base()
+
+class User(Base):
+   __tablename__ = "users"
+
+   id = Column(Integer, primary_key=True)
+   username = Column(String(50), unique=True, index=True, nullable=False)
+   email = Column(String(255), unique=True, index=True, nullable=False)
+   phone_number = Column(String(20), unique=True, nullable=True)
+   password_hash = Column(String(255), nullable=False)
+   twofa_secret = Column(String(32), nullable=False)
+   balance = Column(Numeric(10, 2), default=0, nullable=False)
+   elo = Column(Integer, default=1200, nullable=False)
+   wins = Column(Integer, default=0, nullable=False)
+   losses = Column(Integer, default=0, nullable=False)
+   consent = Column(Boolean, default=False, nullable=False)
+   consent_version = Column(String(20), nullable=True)
+   consent_at = Column(DateTime, nullable=True)
+   consent_hash = Column(String(64), nullable=True)
+   dob = Column(DateTime, nullable=False)
+   dob_locked = Column(Boolean, default=True, nullable=False)
+   withdrawals = Column(Integer, default=0, nullable=False)
+   suspended_until = Column(DateTime, nullable=True)
+   locked_until = Column(DateTime, nullable=True)
+   login_attempts = Column(Integer, default=0)
+   otp_attempts = Column(Integer, default=0)
+   stripe_customer_id = Column(String(255), nullable=True, unique=True)
+   stripe_account_id = Column(String(255), nullable=True)
+   stripe_account_verified = Column(Boolean, default=False, nullable=False)
+   location_country = Column(String(2), nullable=True)
+   location_state = Column(String(2), nullable=True)
+   device_fingerprint = Column(String(255), nullable=True)
+   created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+   updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+   __table_args__ = (
+       CheckConstraint('balance >= 0', name='balance_non_negative'),
+       Index('idx_user_suspended', 'suspended_until'),
+   )
+
+class Game(Base):
+   __tablename__ = "games"
+
+   id = Column(Integer, primary_key=True)
+   white_player_id = Column(Integer, ForeignKey("users.id", ondelete="RESTRICT"), nullable=False, index=True)
+   black_player_id = Column(Integer, ForeignKey("users.id", ondelete="RESTRICT"), nullable=True, index=True)
+   wager = Column(Numeric(10, 2), nullable=False)
+   fen = Column(String(120), nullable=False)
+   active = Column(Boolean, default=True, nullable=False, index=True)
+   current_turn = Column(String(5), default="white", nullable=False)
+   last_move_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+   winner_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+   result = Column(String(20), nullable=True)
+   completed_at = Column(DateTime, nullable=True)
+   created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+   __table_args__ = (
+       Index('idx_active_available', 'active', 'black_player_id'),
+       Index('idx_game_players', 'white_player_id', 'black_player_id'),
+   )
+
+class Transaction(Base):
+   __tablename__ = "transactions"
+
+   id = Column(Integer, primary_key=True)
+   user_id = Column(Integer, ForeignKey("users.id", ondelete="RESTRICT"), index=True, nullable=False)
+   type = Column(String(20), nullable=False, index=True)
+   amount = Column(Numeric(10, 2), nullable=False)
+   status = Column(String(20), nullable=False, index=True)
+   external_id = Column(String(255), index=True, nullable=True)
+   idempotency_key = Column(String(255), unique=True, nullable=True)
+   game_id = Column(Integer, ForeignKey("games.id", ondelete="SET NULL"), nullable=True)
+   created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+
+class AuditLog(Base):
+   __tablename__ = "audit_logs"
+
+   id = Column(Integer, primary_key=True)
+   user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+   action = Column(String(50), nullable=False, index=True)
+   ip_address = Column(String(45), nullable=True)
+   country = Column(String(2), nullable=True)
+   state = Column(String(2), nullable=True)
+   details = Column(String(500), nullable=True)
+   request_id = Column(String(36), nullable=True)
+   created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+
+class RevokedToken(Base):
+   __tablename__ = "revoked_tokens"
+
+   id = Column(Integer, primary_key=True)
+   jti = Column(String(36), unique=True, nullable=False, index=True)
+   revoked_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+from pydantic import BaseModel, EmailStr, Field
+from decimal import Decimal
+from typing import Optional
+
+class RegisterRequest(BaseModel):
+   username: str = Field(..., min_length=3, max_length=50)
+   email: EmailStr
+   phone_number: str
+   password: str = Field(..., min_length=8, max_length=128)
+   dob: str
+
+class LoginRequest(BaseModel):
+   username: str
+   password: str
+   otp: str = Field(..., min_length=6, max_length=6)
+
+class TokenResponse(BaseModel):
+   access_token: str
+   token_type: str = "bearer"
+
+class DepositRequest(BaseModel):
+   amount: Decimal = Field(..., gt=0, decimal_places=2)
+   idempotency_key: Optional[str]
+
+class WithdrawRequest(BaseModel):
+   amount: Decimal = Field(..., gt=0, decimal_places=2)
+   idempotency_key: Optional[str]
+
+class MatchRequest(BaseModel):
+   wager: Decimal = Field(..., gt=0, decimal_places=2)
+
+class MoveRequest(BaseModel):
+   move: str = Field(..., min_length=4, max_length=5)
+
+class ErrorResponse(BaseModel):
+   error: str
+   status_code: int
+   request_id: Optional[str] = None
+
+from passlib.context import CryptContext
+from jose import jwt, JWTError
+from fastapi import HTTPException, Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from datetime import datetime, timedelta
+from uuid import uuid4
+from sqlalchemy.orm import Session
+
+from config import Config
+from models import RevokedToken, User
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+security = HTTPBearer()
+
+def hash_password(password: str) -> str:
+   return pwd_context.hash(password)
+
+def verify_password(password: str, hash_: str) -> bool:
+   return pwd_context.verify(password, hash_)
+
+def create_token(uid: int) -> str:
+   jti = str(uuid4())
+   payload = {
+       "sub": str(uid),
+       "jti": jti,
+       "iat": datetime.utcnow(),
+       "exp": datetime.utcnow() + timedelta(hours=Config.TOKEN_EXPIRE_HOURS),
+       "iss": "chess-platform",
+       "aud": "chess-api"
+   }
+   return jwt.encode(payload, Config.SECRET_KEY, algorithm=Config.ALGORITHM)
+
+def verify_token(creds: HTTPAuthorizationCredentials = Depends(security), db: Session = None) -> int:
+   try:
+       payload = jwt.decode(creds.credentials, Config.SECRET_KEY, algorithms=[Config.ALGORITHM], audience="chess-api", issuer="chess-platform")
+       uid = int(payload.get("sub"))
+       jti = payload.get("jti")
+       if jti and db:
+           revoked = db.query(RevokedToken).filter(RevokedToken.jti == jti).first()
+           if revoked:
+               raise HTTPException(401, "Token has been revoked")
+       if uid is None:
+           raise HTTPException(401, "Invalid token")
+       return uid
+   except JWTError:
+       raise HTTPException(401, "Invalid or expired token")
+
+def get_current_user(user_id: int = Depends(verify_token), db: Session = None):
+   user = db.query(User).filter(User.id == user_id).first()
+   if not user:
+       raise HTTPException(404, "User not found")
+   if user.locked_until and user.locked_until > datetime.utcnow():
+       raise HTTPException(403, f"Account locked until {user.locked_until}")
+   if user.suspended_until and user.suspended_until > datetime.utcnow():
+       raise HTTPException(403, f"Account suspended until {user.suspended_until}")
+   return user
+
+from fastapi import Request, HTTPException
+from datetime import datetime, timedelta
+from models import User
+from config import Config
+
+def get_geo(request: Request):
+   country = request.headers.get("CF-IPCountry", "US")
+   state = request.headers.get("CF-Region")
+   ip = request.client.host if request.client else "unknown"
+   forwarded_for = request.headers.get("X-Forwarded-For", "")
+   if forwarded_for.count(",") > 3:
+       raise HTTPException(403, "VPN or proxy detected")
+   return country, state, ip
+
+def enforce_geo(request: Request, db, user_id=None):
+   country, state, ip = get_geo(request)
+   if country in Config.COUNTRY_MUST_BLOCK:
+       raise HTTPException(403, "Service not available in your country")
+   if country in Config.COUNTRY_RESTRICTED:
+       raise HTTPException(403, "Service restricted in your country")
+   if country == "US":
+       if state in Config.US_MUST_BLOCK:
+           raise HTTPException(403, "Service not available in your state")
+       if state in Config.US_RESTRICTED:
+           raise HTTPException(403, "Service restricted in your state")
+   if user_id:
+       user = db.query(User).filter(User.id == user_id).first()
+       if user and user.location_country and user.location_country != country:
+           user.suspended_until = datetime.utcnow() + timedelta(days=30)
+           db.commit()
+           raise HTTPException(403, "Location change detected - account suspended")
+   return country, state, ip
+
+def wager_cap(state: str):
+   return Config.STATE_WAGER_LIMITS.get(state, Config.MAX_WAGER_DEFAULT)
+
+from datetime import datetime
+from models import AuditLog, Transaction
+from decimal import Decimal
+
+def log_audit(db, user_id, action, ip, country, state, details=None, request_id=None):
+   audit = AuditLog(
+       user_id=user_id, action=action, ip_address=ip, country=country, state=state,
+       details=details, request_id=request_id
+   )
+   db.add(audit)
+   db.commit()
+
+def log_transaction(db, user_id, trans_type, amount: Decimal, trans_status="pending", external_id=None, game_id=None, idempotency_key=None):
+   trans = Transaction(
+       user_id=user_id, type=trans_type, amount=amount, status=trans_status,
+       external_id=external_id, game_id=game_id, idempotency_key=idempotency_key
+   )
+   db.add(trans)
+   db.commit()
+   db.refresh(trans)
+   return trans
+
+import asyncio
+import chess
+from datetime import datetime, timedelta
+from models import Game, User
+from config import Config
+
+active_games = {}
+waiting_queue = []
+
+RECONNECT_TIMEOUT = 60  # seconds
+
+def initial_skill_assessment(user):
+   # Placeholder: simple 1200 ± random
+   return 1200
+
+def adjust_skill(user, win: bool):
+   if win:
+       user.elo += 15
+   else:
+       user.elo = max(100, user.elo - 10)
+
+async def match_players(db):
+   # auto-match based on skill ±100
+   if len(waiting_queue) < 2:
+       return
+   waiting_queue.sort(key=lambda u: u['user'].elo)
+   for i in range(len(waiting_queue)-1):
+       u1, u2 = waiting_queue[i], waiting_queue[i+1]
+       if abs(u1['user'].elo - u2['user'].elo) <= 100:
+           # Create Game
+           game = Game(
+               white_player_id=u1['user'].id,
+               black_player_id=u2['user'].id,
+               wager=u1['wager'],
+               fen=chess.Board().fen()
+           )
+           db.add(game)
+           db.commit()
+           db.refresh(game)
+           active_games[game.id] = {
+               "white": u1['ws'],
+               "black": u2['ws'],
+               "fen": game.fen,
+               "last_move": datetime.utcnow()
+           }
+           waiting_queue.remove(u1)
+           waiting_queue.remove(u2)
+           break
+
+async def handle_disconnect(game_id, player_color):
+   # start 1-minute reconnect timer
+   await asyncio.sleep(RECONNECT_TIMEOUT)
+   game = active_games.get(game_id)
+   if not game:
+       return
+   if player_color == "white":
+       disconnected_player = game['white']
+       winner_color = "black"
+   else:
+       disconnected_player = game['black']
+       winner_color = "white"
+   # assign win to opponent
+   # TODO: update DB, adjust skill
+   active_games.pop(game_id, None)
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from slowapi import Limiter
+from slowapi.errors import RateLimitExceeded
+from routers import auth_router, user_router, financial_router, games_router
+
+app = FastAPI(title="Chess Skill Platform", version="2.0.0")
+limiter = Limiter(key_func=lambda request: request.client.host)
+app.state.limiter = limiter
+
+app.add_middleware(
+   CORSMiddleware,
+   allow_origins=["*"],
+   allow_credentials=True,
+   allow_methods=["*"],
+   allow_headers=["*"]
+)
+
+# include routers
+app.include_router(auth_router, prefix="/auth")
+app.include_router(user_router, prefix="/user")
+app.include_router(financial_router, prefix="/financial")
+app.include_router(games_router, prefix="/games")
+
+@app.websocket("/ws/game/{game_id}")
+async def websocket_endpoint(websocket: WebSocket, game_id: int):
+   await websocket.accept()
+   # Assign to active game
+   try:
+       while True:
+           data = await websocket.receive_json()
+           # Process move
+   except WebSocketDisconnect:
+       # Trigger reconnection timer
+       pass
